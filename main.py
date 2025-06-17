@@ -21,11 +21,14 @@ GEMINI_VOICES = {
     "Narrator": "gemini-1.5-pro-preview-tts",
 }
 
+# --- Robust Audio Recorder Class ---
 class AudioRecorder(AudioProcessorBase):
     def __init__(self):
+        super().__init__()
         self.audio_frames = []
 
     def recv(self, frame):
+        # The frames are received from the browser in PyAV format
         self.audio_frames.append(frame)
         return frame
 
@@ -35,10 +38,11 @@ class AudioRecorder(AudioProcessorBase):
         
         sound_chunk = self.audio_frames[0]
         sample_rate = sound_chunk.sample_rate
-        sample_width = sound_chunk.format.bytes
         
+        # Convert all PyAV frames to a single numpy array
         sound_data = np.hstack([frame.to_ndarray() for frame in self.audio_frames])
-
+        
+        # Write to an in-memory WAV file buffer
         buffer = io.BytesIO()
         sf.write(buffer, data=sound_data.T, samplerate=sample_rate, format='WAV', subtype='PCM_16')
         buffer.seek(0)
@@ -62,7 +66,7 @@ def process_document(uploaded_file):
     model = genai.GenerativeModel('gemini-1.5-flash')
     file_data = {"mime_type": uploaded_file.type, "data": uploaded_file.getvalue()}
     prompt = "Extract all text content from this document. Preserve the original paragraph structure."
-    with st.spinner("myBook is reading and analyzing the document..."):
+    with st.spinner("🧠 Gemini is reading and analyzing the document..."):
         response = model.generate_content([prompt, file_data])
         full_text = response.text
     chunks = [p.strip() for p in full_text.split('\n\n') if len(p.strip()) > 100]
@@ -77,7 +81,7 @@ def transcribe_audio_with_gemini(audio_bytes):
         audio_file = genai.upload_file(path=audio_bytes, display_name="user_audio", mime_type="audio/wav")
         model = genai.GenerativeModel('gemini-1.5-pro')
         response = model.generate_content(["Transcribe this audio.", audio_file])
-        genai.delete_file(audio_file.name) # Clean up the uploaded file
+        genai.delete_file(audio_file.name)
         return response.text if response.text else ""
     except Exception as e:
         st.error(f"Gemini Speech-to-Text Error: {e}"); return ""
@@ -96,8 +100,7 @@ def generate_tts_with_gemini(text):
     try:
         tts_model = genai.GenerativeModel("gemini-1.5-pro-preview-tts")
         response = tts_model.generate_content(text, stream=True, generation_config={"response_mime_type": "audio/wav"})
-        audio_data = b''.join([chunk.audio_content for chunk in response])
-        return audio_data
+        return b''.join([chunk.audio_content for chunk in response])
     except Exception as e:
         st.error(f"Native Gemini TTS Error: {e}"); return None
 
@@ -112,10 +115,10 @@ with st.sidebar:
     qa_voice = st.selectbox("Q&A Voice", options=GEMINI_VOICES.keys(), index=0)
     podcast_voice = st.selectbox("Podcast Voice", options=GEMINI_VOICES.keys(), index=1)
     st.markdown("---")
-    st.info("This app uses Gemini 1.5 for all AI tasks, including document analysis, Q&A, and voice processing.")
+    st.info("This app uses Gemini 1.5 for all AI tasks.")
 
 if not st.session_state.apis_configured:
-    st.error("Assistant not initialized. Please set your GEMINI_API_KEY in the Streamlit Cloud secrets.")
+    st.error("Assistant not initialized. Please ensure your GEMINI_API_KEY is set in your Streamlit Cloud secrets.")
 else:
     tab1, tab2 = st.tabs(["🎧 Podcast Generator", "💬 Voice Q&A"])
 
@@ -151,32 +154,26 @@ else:
                     st.markdown(entry["text"])
                     if "audio" in entry and entry["audio"]: st.audio(entry["audio"], format="audio/wav")
 
-            # NEW: Robust Audio Recording UI
-            webrtc_ctx = webrtc_streamer(
-                key="speech-to-text",
-                mode=WebRtcMode.SENDONLY,
-                audio_processor_factory=AudioRecorder,
-                media_stream_constraints={"audio": True, "video": False},
-                send_interval=1000,
-            )
+            webrtc_ctx = webrtc_streamer(key="speech-to-text", mode=WebRtcMode.SENDONLY, audio_processor_factory=AudioRecorder, media_stream_constraints={"audio": True, "video": False})
 
             if not webrtc_ctx.state.playing:
-                if st.button("Process Recorded Question", use_container_width=True):
-                    if webrtc_ctx.audio_processor:
-                        audio_bytes = webrtc_ctx.audio_processor.get_audio_bytes()
-                        if audio_bytes:
-                            with st.spinner("Transcribing your question..."):
-                                user_query = transcribe_audio_with_gemini(io.BytesIO(audio_bytes))
-                            
-                            if user_query:
-                                st.session_state.chat_history.append({"role": "user", "text": user_query})
-                                with st.spinner("Finding answer in document..."):
-                                    answer_text = get_rag_response(user_query, st.session_state.chunks, st.session_state.embeddings)
-                                with st.spinner("Generating voice reply..."):
-                                    answer_audio = generate_tts_with_gemini(answer_text)
-                                st.session_state.chat_history.append({"role": "assistant", "text": answer_text, "audio": answer_audio})
-                                st.rerun()
-                        else:
-                            st.warning("No audio was recorded. Please try recording again.")
-                    else:
-                        st.error("Audio processor not found. Please refresh the page.")
+                st.markdown("Click **START** to begin recording your question, then **STOP** when you are finished.")
+            else:
+                st.info("🔴 Recording...")
+            
+            if st.button("Process Recorded Question", use_container_width=True, disabled=webrtc_ctx.state.playing):
+                if webrtc_ctx.audio_processor:
+                    audio_bytes = webrtc_ctx.audio_processor.get_audio_bytes()
+                    if audio_bytes:
+                        with st.spinner("Transcribing your question..."):
+                            user_query = transcribe_audio_with_gemini(io.BytesIO(audio_bytes))
+                        if user_query:
+                            st.session_state.chat_history.append({"role": "user", "text": user_query})
+                            with st.spinner("Finding answer..."):
+                                answer_text = get_rag_response(user_query, st.session_state.chunks, st.session_state.embeddings)
+                            with st.spinner("Generating voice reply..."):
+                                answer_audio = generate_tts_with_gemini(answer_text)
+                            st.session_state.chat_history.append({"role": "assistant", "text": answer_text, "audio": answer_audio})
+                            st.rerun()
+                    else: st.warning("No audio recorded. Please start and stop recording again.")
+                else: st.error("Audio processor not found. Please refresh.")
