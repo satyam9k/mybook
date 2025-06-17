@@ -229,7 +229,7 @@ class GeminiDocumentProcessor:
         """Initialize the Gemini client"""
         try:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-pro')
+            self.model = genai.GenerativeModel('gemini-2.0-flash')
             self.embedding_model = 'models/embedding-004'
             self.tts_processor = GeminiTTSProcessor(api_key)
             logger.info("Gemini API configured successfully")
