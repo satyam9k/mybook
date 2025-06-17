@@ -1,0 +1,8 @@
+streamlit
+google-generativeai
+google-cloud-texttospeech
+google-cloud-speech
+numpy
+Pillow
+PyMuPDF
+streamlit-audiorecorder
