@@ -1,179 +1,527 @@
 import streamlit as st
 import google.generativeai as genai
-import numpy as np
-import os
-import soundfile as sf
+from PIL import Image
+import PyPDF2
 import io
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import pickle
+import tempfile
+import os
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
+import threading
+import queue
+import time
+from typing import List, Dict, Any, Optional
+import logging
 
-# --- Page Configuration ---
-st.set_page_config(page_title="Voice Notebook AI", page_icon="🎙️", layout="wide")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- State Management ---
-for key in ["document_processed", "podcast_summary", "podcast_audio", "chat_history", "apis_configured", "chunks", "embeddings"]:
-    if key not in st.session_state:
-        st.session_state[key] = False if key in ["document_processed", "apis_configured"] else ([] if key == "chat_history" else None)
+# Page configuration
+st.set_page_config(
+    page_title="myBook - AI Document Assistant",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --- API & Voice Configuration ---
-GEMINI_VOICES = {
-    "Male 1 (Puck)": "Puck",
-    "Female 1 (Achernar)": "Achernar",
-    "Narrator": "gemini-1.5-pro-preview-tts",
-}
+# Custom CSS for better UI
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        text-align: center;
+        margin-bottom: 2rem;
+        color: #1f77b4;
+    }
+    .feature-card {
+        background-color: #f8f9fa;
+        padding: 1.5rem;
+        border-radius: 10px;
+        border-left: 4px solid #1f77b4;
+        margin: 1rem 0;
+    }
+    .success-message {
+        background-color: #d4edda;
+        color: #155724;
+        padding: 0.75rem;
+        border-radius: 5px;
+        border: 1px solid #c3e6cb;
+    }
+    .error-message {
+        background-color: #f8d7da;
+        color: #721c24;
+        padding: 0.75rem;
+        border-radius: 5px;
+        border: 1px solid #f5c6cb;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# --- Robust Audio Recorder Class ---
-class AudioRecorder(AudioProcessorBase):
+class AudioRecorder:
+    """Audio recorder class using WebRTC for reliable audio capture"""
+    
     def __init__(self):
-        super().__init__()
         self.audio_frames = []
-
-    def recv(self, frame):
-        # The frames are received from the browser in PyAV format
-        self.audio_frames.append(frame)
-        return frame
-
-    def get_audio_bytes(self):
-        if not self.audio_frames:
-            return None
+        self.audio_queue = queue.Queue()
         
-        sound_chunk = self.audio_frames[0]
-        sample_rate = sound_chunk.sample_rate
-        
-        # Convert all PyAV frames to a single numpy array
-        sound_data = np.hstack([frame.to_ndarray() for frame in self.audio_frames])
-        
-        # Write to an in-memory WAV file buffer
-        buffer = io.BytesIO()
-        sf.write(buffer, data=sound_data.T, samplerate=sample_rate, format='WAV', subtype='PCM_16')
-        buffer.seek(0)
-        return buffer.read()
+    def audio_frame_callback(self, frame):
+        """Callback function to handle audio frames"""
+        try:
+            sound = frame.to_ndarray()
+            self.audio_queue.put(sound)
+        except Exception as e:
+            logger.error(f"Error in audio frame callback: {e}")
+    
+    def get_audio_data(self):
+        """Get recorded audio data"""
+        audio_data = []
+        try:
+            while not self.audio_queue.empty():
+                audio_data.append(self.audio_queue.get())
+        except Exception as e:
+            logger.error(f"Error getting audio data: {e}")
+        return audio_data
 
-# --- Backend API Functions ---
-def configure_apis():
-    try:
-        if "GEMINI_API_KEY" not in st.secrets:
-            st.error("GEMINI_API_KEY not found. Please add it to your Streamlit secrets.")
-            return False
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        st.session_state.apis_configured = True
-        return True
-    except Exception as e:
-        st.error(f"Failed to configure Gemini API: {e}"); return False
-
-@st.cache_data(show_spinner=False)
-def process_document(uploaded_file):
-    st.session_state.chat_history = []
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    file_data = {"mime_type": uploaded_file.type, "data": uploaded_file.getvalue()}
-    prompt = "Extract all text content from this document. Preserve the original paragraph structure."
-    with st.spinner("🧠 Gemini is reading and analyzing the document..."):
-        response = model.generate_content([prompt, file_data])
-        full_text = response.text
-    chunks = [p.strip() for p in full_text.split('\n\n') if len(p.strip()) > 100]
-    with st.spinner("🔬 Creating semantic index..."):
-        embedding_model = 'models/text-embedding-004'
-        response = genai.embed_content(model=embedding_model, content=chunks, task_type="RETRIEVAL_DOCUMENT")
-        chunk_embeddings = [item['embedding'] for item in response['embedding']]
-        return chunks, chunk_embeddings
-
-def transcribe_audio_with_gemini(audio_bytes):
-    try:
-        audio_file = genai.upload_file(path=audio_bytes, display_name="user_audio", mime_type="audio/wav")
-        model = genai.GenerativeModel('gemini-1.5-pro')
-        response = model.generate_content(["Transcribe this audio.", audio_file])
-        genai.delete_file(audio_file.name)
-        return response.text if response.text else ""
-    except Exception as e:
-        st.error(f"Gemini Speech-to-Text Error: {e}"); return ""
-
-def get_rag_response(query, chunks, embeddings):
-    embedding_model, model = 'models/text-embedding-004', genai.GenerativeModel('gemini-1.5-flash')
-    query_embedding = genai.embed_content(model=embedding_model, content=query, task_type="RETRIEVAL_QUERY")['embedding']
-    dot_products = np.dot(np.array(embeddings), query_embedding)
-    top_indices = np.argsort(dot_products)[-5:][::-1]
-    relevant_context = "\n---\n".join([chunks[i] for i in top_indices])
-    prompt = f"Answer the user's question based *only* on the provided context.\nCONTEXT:\n---\n{relevant_context}\n---\nQUESTION: {query}\n\nANSWER:"
-    response = model.generate_content(prompt)
-    return response.text
-
-def generate_tts_with_gemini(text):
-    try:
-        tts_model = genai.GenerativeModel("gemini-1.5-pro-preview-tts")
-        response = tts_model.generate_content(text, stream=True, generation_config={"response_mime_type": "audio/wav"})
-        return b''.join([chunk.audio_content for chunk in response])
-    except Exception as e:
-        st.error(f"Native Gemini TTS Error: {e}"); return None
-
-# --- UI Layout ---
-st.title("🎙️ Voice Notebook AI")
-st.markdown("Your personal AI assistant, powered entirely by the Gemini 1.5 API.")
-
-if not st.session_state.apis_configured: configure_apis()
-
-with st.sidebar:
-    st.header("🔊 Voice Selection")
-    qa_voice = st.selectbox("Q&A Voice", options=GEMINI_VOICES.keys(), index=0)
-    podcast_voice = st.selectbox("Podcast Voice", options=GEMINI_VOICES.keys(), index=1)
-    st.markdown("---")
-    st.info("This app uses Gemini 1.5 for all AI tasks.")
-
-if not st.session_state.apis_configured:
-    st.error("Assistant not initialized. Please ensure your GEMINI_API_KEY is set in your Streamlit Cloud secrets.")
-else:
-    tab1, tab2 = st.tabs(["🎧 Podcast Generator", "💬 Voice Q&A"])
-
-    with tab1:
-        st.header("Create a Podcast from Your Document")
-        uploaded_file = st.file_uploader("Upload Document (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"], key="podcast_uploader")
-
-        if uploaded_file:
-            st.session_state.chunks, st.session_state.embeddings = process_document(uploaded_file)
-            st.session_state.document_processed = st.session_state.chunks is not None
-            if st.session_state.document_processed: st.success(f"Document '{uploaded_file.name}' processed.")
-
-        if st.session_state.document_processed:
-            if st.button("✨ Generate Podcast Summary & Audio", use_container_width=True):
-                full_text = " ".join(st.session_state.chunks)
-                model = genai.GenerativeModel('gemini-1.5-flash')
-                prompt = "Summarize the document in a clear, narrative style for a short podcast."
-                with st.spinner("Generating podcast script..."):
-                    st.session_state.podcast_summary = model.generate_content([prompt, full_text]).text
-                with st.spinner("Converting script to audio..."):
-                    st.session_state.podcast_audio = generate_tts_with_gemini(st.session_state.podcast_summary)
+class GeminiDocumentProcessor:
+    """Main class for processing documents using Gemini API"""
+    
+    def __init__(self, api_key: str):
+        """Initialize the Gemini client"""
+        try:
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-pro')
+            self.embedding_model = 'models/embedding-001'
+            logger.info("Gemini API configured successfully")
+        except Exception as e:
+            logger.error(f"Error configuring Gemini API: {e}")
+            raise
+    
+    def extract_text_from_pdf(self, pdf_file) -> str:
+        """Extract text from PDF file"""
+        try:
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text.strip()
+        except Exception as e:
+            logger.error(f"Error extracting text from PDF: {e}")
+            return ""
+    
+    def extract_text_from_image(self, image_file) -> str:
+        """Extract text from image using Gemini Vision"""
+        try:
+            image = Image.open(image_file)
+            prompt = """
+            Please extract all the text content from this image. 
+            Provide the text exactly as it appears, maintaining the original structure and formatting as much as possible.
+            If there are multiple columns or sections, please preserve that organization.
+            """
             
-            if st.session_state.podcast_summary: st.subheader("Podcast Script"); st.markdown(st.session_state.podcast_summary)
-            if st.session_state.podcast_audio: st.subheader("Listen to Your Podcast"); st.audio(st.session_state.podcast_audio, format='audio/wav')
-
-    with tab2:
-        st.header("Ask Questions with Your Voice")
-        if not st.session_state.document_processed:
-            st.warning("Please upload and process a document in the 'Podcast Generator' tab first.")
-        else:
-            for entry in st.session_state.chat_history:
-                with st.chat_message(entry["role"]):
-                    st.markdown(entry["text"])
-                    if "audio" in entry and entry["audio"]: st.audio(entry["audio"], format="audio/wav")
-
-            webrtc_ctx = webrtc_streamer(key="speech-to-text", mode=WebRtcMode.SENDONLY, audio_processor_factory=AudioRecorder, media_stream_constraints={"audio": True, "video": False})
-
-            if not webrtc_ctx.state.playing:
-                st.markdown("Click **START** to begin recording your question, then **STOP** when you are finished.")
+            response = self.model.generate_content([prompt, image])
+            return response.text
+        except Exception as e:
+            logger.error(f"Error extracting text from image: {e}")
+            return ""
+    
+    def process_document(self, uploaded_file) -> str:
+        """Process uploaded document and extract text"""
+        try:
+            file_type = uploaded_file.type
+            
+            if file_type == "application/pdf":
+                return self.extract_text_from_pdf(uploaded_file)
+            elif file_type in ["image/jpeg", "image/png", "image/jpg"]:
+                return self.extract_text_from_image(uploaded_file)
             else:
-                st.info("🔴 Recording...")
+                st.error(f"Unsupported file type: {file_type}")
+                return ""
+        except Exception as e:
+            logger.error(f"Error processing document: {e}")
+            st.error(f"Error processing document: {str(e)}")
+            return ""
+    
+    def generate_podcast_script(self, text: str, voice_style: str) -> str:
+        """Generate podcast script from document text"""
+        try:
+            prompt = f"""
+            You are an expert podcast scriptwriter. Create an engaging, conversational podcast script based on the following document content.
             
-            if st.button("Process Recorded Question", use_container_width=True, disabled=webrtc_ctx.state.playing):
-                if webrtc_ctx.audio_processor:
-                    audio_bytes = webrtc_ctx.audio_processor.get_audio_bytes()
-                    if audio_bytes:
-                        with st.spinner("Transcribing your question..."):
-                            user_query = transcribe_audio_with_gemini(io.BytesIO(audio_bytes))
-                        if user_query:
-                            st.session_state.chat_history.append({"role": "user", "text": user_query})
-                            with st.spinner("Finding answer..."):
-                                answer_text = get_rag_response(user_query, st.session_state.chunks, st.session_state.embeddings)
-                            with st.spinner("Generating voice reply..."):
-                                answer_audio = generate_tts_with_gemini(answer_text)
-                            st.session_state.chat_history.append({"role": "assistant", "text": answer_text, "audio": answer_audio})
+            Voice Style: {voice_style}
+            
+            Guidelines:
+            1. Create a narrative that flows naturally as if being spoken aloud
+            2. Include natural transitions and conversational elements
+            3. Highlight key insights and interesting points from the document
+            4. Make it engaging and easy to follow when listened to
+            5. Aim for approximately 3-5 minutes of spoken content
+            6. Use a tone appropriate for the {voice_style.lower()} voice style
+            7. Include brief pauses and emphasis where appropriate (use punctuation to indicate)
+            
+            Document Content:
+            {text}
+            
+            Please create a compelling podcast script that captures the essence of this document in an audio-friendly format.
+            """
+            
+            response = self.model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            logger.error(f"Error generating podcast script: {e}")
+            return ""
+    
+    def text_to_speech(self, text: str, voice_style: str) -> Optional[bytes]:
+        """Convert text to speech using Gemini TTS"""
+        try:
+            # Note: As of my knowledge cutoff, Gemini doesn't have native TTS
+            # This is a placeholder for when the functionality becomes available
+            # For now, we'll return a message explaining this limitation
+            st.warning("""
+            **Note**: Gemini API doesn't currently support native Text-to-Speech functionality.
+            The podcast script has been generated and is displayed below.
+            
+            To implement TTS, you would need to:
+            1. Use Google Cloud Text-to-Speech API
+            2. Use an alternative TTS service
+            3. Wait for Gemini to add native TTS support
+            
+            The generated script is ready to be used with any TTS service of your choice.
+            """)
+            return None
+        except Exception as e:
+            logger.error(f"Error in text-to-speech: {e}")
+            return None
+    
+    def speech_to_text(self, audio_data: bytes) -> str:
+        """Convert speech to text using Gemini STT"""
+        try:
+            # Note: Similar to TTS, Gemini doesn't have native STT
+            # This is a placeholder for when the functionality becomes available
+            st.warning("""
+            **Note**: Gemini API doesn't currently support native Speech-to-Text functionality.
+            
+            To implement STT, you would need to:
+            1. Use Google Cloud Speech-to-Text API
+            2. Use an alternative STT service
+            3. Wait for Gemini to add native STT support
+            
+            For now, please type your questions in the text input below.
+            """)
+            return ""
+        except Exception as e:
+            logger.error(f"Error in speech-to-text: {e}")
+            return ""
+    
+    def create_embeddings(self, text_chunks: List[str]) -> List[List[float]]:
+        """Create embeddings for text chunks using Gemini"""
+        try:
+            embeddings = []
+            for chunk in text_chunks:
+                result = genai.embed_content(
+                    model=self.embedding_model,
+                    content=chunk,
+                    task_type="retrieval_document"
+                )
+                embeddings.append(result['embedding'])
+            return embeddings
+        except Exception as e:
+            logger.error(f"Error creating embeddings: {e}")
+            return []
+    
+    def split_text_into_chunks(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        """Split text into overlapping chunks for RAG"""
+        try:
+            words = text.split()
+            chunks = []
+            
+            for i in range(0, len(words), chunk_size - overlap):
+                chunk = ' '.join(words[i:i + chunk_size])
+                if len(chunk.strip()) > 0:
+                    chunks.append(chunk.strip())
+            
+            return chunks
+        except Exception as e:
+            logger.error(f"Error splitting text: {e}")
+            return []
+    
+    def find_relevant_chunks(self, query: str, text_chunks: List[str], embeddings: List[List[float]], top_k: int = 3) -> List[str]:
+        """Find most relevant text chunks for a query using cosine similarity"""
+        try:
+            # Create embedding for the query
+            query_result = genai.embed_content(
+                model=self.embedding_model,
+                content=query,
+                task_type="retrieval_query"
+            )
+            query_embedding = query_result['embedding']
+            
+            # Calculate similarities
+            similarities = cosine_similarity([query_embedding], embeddings)[0]
+            
+            # Get top k most similar chunks
+            top_indices = np.argsort(similarities)[-top_k:][::-1]
+            relevant_chunks = [text_chunks[i] for i in top_indices]
+            
+            return relevant_chunks
+        except Exception as e:
+            logger.error(f"Error finding relevant chunks: {e}")
+            return []
+    
+    def generate_answer(self, query: str, relevant_chunks: List[str]) -> str:
+        """Generate answer using RAG with relevant chunks"""
+        try:
+            context = "\n\n".join(relevant_chunks)
+            
+            prompt = f"""
+            Based on the following context from the document, please answer the user's question.
+            
+            Context:
+            {context}
+            
+            Question: {query}
+            
+            Instructions:
+            1. Answer based primarily on the provided context
+            2. If the context doesn't contain enough information, say so clearly
+            3. Be concise but comprehensive
+            4. Maintain accuracy and avoid speculation beyond the document content
+            
+            Answer:
+            """
+            
+            response = self.model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            logger.error(f"Error generating answer: {e}")
+            return "I'm sorry, I encountered an error while generating the answer."
+
+def initialize_session_state():
+    """Initialize session state variables"""
+    if 'document_processed' not in st.session_state:
+        st.session_state.document_processed = False
+    if 'document_text' not in st.session_state:
+        st.session_state.document_text = ""
+    if 'text_chunks' not in st.session_state:
+        st.session_state.text_chunks = []
+    if 'embeddings' not in st.session_state:
+        st.session_state.embeddings = []
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    if 'processor' not in st.session_state:
+        st.session_state.processor = None
+
+def main():
+    """Main application function"""
+    
+    # Initialize session state
+    initialize_session_state()
+    
+    # Header
+    st.markdown('<div class="main-header">📚 myBook - AI Document Assistant</div>', unsafe_allow_html=True)
+    st.markdown("---")
+    
+    # Initialize Gemini processor
+    try:
+        if st.session_state.processor is None:
+            api_key = st.secrets["GEMINI_API_KEY"]
+            st.session_state.processor = GeminiDocumentProcessor(api_key)
+    except Exception as e:
+        st.error(f"Error initializing Gemini API. Please check your API key configuration: {str(e)}")
+        st.stop()
+    
+    # Sidebar for voice style selection
+    with st.sidebar:
+        st.header("🎙️ Voice Settings")
+        voice_style = st.selectbox(
+            "Select Voice Style:",
+            ["Male", "Female", "Narrator"],
+            index=0
+        )
+        
+        st.markdown("---")
+        st.markdown("### 📋 Instructions")
+        st.markdown("""
+        1. **Upload Document**: Start by uploading a PDF or image file
+        2. **Generate Podcast**: Create an AI-generated podcast summary
+        3. **Voice Q&A**: Ask questions about your document using voice or text
+        """)
+        
+        if st.session_state.document_processed:
+            st.success("✅ Document processed successfully!")
+        else:
+            st.info("📄 Please upload a document to begin")
+    
+    # Main content tabs
+    tab1, tab2 = st.tabs(["🎧 Podcast Generator", "💬 Voice Q&A"])
+    
+    with tab1:
+        st.header("🎧 Podcast Generator")
+        st.markdown("Upload a document and generate an engaging podcast summary.")
+        
+        # File upload
+        uploaded_file = st.file_uploader(
+            "Choose a file",
+            type=['pdf', 'png', 'jpg', 'jpeg'],
+            help="Upload a PDF document or image file (PNG, JPG, JPEG)"
+        )
+        
+        if uploaded_file is not None:
+            st.success(f"File uploaded: {uploaded_file.name}")
+            
+            # Process document button
+            if st.button("📖 Process Document", type="primary"):
+                with st.spinner("Processing document..."):
+                    try:
+                        # Extract text from document
+                        document_text = st.session_state.processor.process_document(uploaded_file)
+                        
+                        if document_text:
+                            st.session_state.document_text = document_text
+                            st.session_state.document_processed = True
+                            
+                            # Prepare for RAG
+                            st.session_state.text_chunks = st.session_state.processor.split_text_into_chunks(document_text)
+                            st.session_state.embeddings = st.session_state.processor.create_embeddings(st.session_state.text_chunks)
+                            
+                            st.markdown('<div class="success-message">✅ Document processed successfully!</div>', unsafe_allow_html=True)
+                            
+                            # Show document preview
+                            with st.expander("📄 Document Preview", expanded=False):
+                                st.text_area("Extracted Text:", document_text[:1000] + "..." if len(document_text) > 1000 else document_text, height=200)
+                        else:
+                            st.error("Failed to extract text from the document. Please try again.")
+                    except Exception as e:
+                        st.error(f"Error processing document: {str(e)}")
+            
+            # Generate podcast script
+            if st.session_state.document_processed:
+                st.markdown("---")
+                if st.button("🎙️ Generate Podcast Script", type="secondary"):
+                    with st.spinner("Generating podcast script..."):
+                        try:
+                            script = st.session_state.processor.generate_podcast_script(
+                                st.session_state.document_text, 
+                                voice_style
+                            )
+                            
+                            if script:
+                                st.markdown("### 📝 Generated Podcast Script")
+                                st.markdown('<div class="feature-card">', unsafe_allow_html=True)
+                                st.markdown(script)
+                                st.markdown('</div>', unsafe_allow_html=True)
+                                
+                                # Attempt TTS (will show warning about limitation)
+                                audio_data = st.session_state.processor.text_to_speech(script, voice_style)
+                                
+                                # Download button for script
+                                st.download_button(
+                                    label="📥 Download Podcast Script",
+                                    data=script,
+                                    file_name=f"podcast_script_{uploaded_file.name}.txt",
+                                    mime="text/plain"
+                                )
+                            else:
+                                st.error("Failed to generate podcast script. Please try again.")
+                        except Exception as e:
+                            st.error(f"Error generating podcast script: {str(e)}")
+    
+    with tab2:
+        st.header("💬 Voice Q&A")
+        st.markdown("Ask questions about your document using voice or text input.")
+        
+        if not st.session_state.document_processed:
+            st.warning("⚠️ Please upload and process a document in the 'Podcast Generator' tab first.")
+        else:
+            st.success("✅ Document is ready for Q&A!")
+            
+            # Voice recording section
+            st.markdown("### 🎤 Voice Input")
+            
+            # WebRTC audio recorder
+            rtc_configuration = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+            
+            audio_recorder = AudioRecorder()
+            
+            webrtc_ctx = webrtc_streamer(
+                key="speech-to-text",
+                mode=WebRtcMode.SENDONLY,
+                rtc_configuration=rtc_configuration,
+                audio_frame_callback=audio_recorder.audio_frame_callback,
+                media_stream_constraints={"video": False, "audio": True},
+                async_processing=True,
+            )
+            
+            if webrtc_ctx.audio_receiver:
+                st.info("🎙️ Audio recorder is active. Click 'START' to begin recording your question.")
+            
+            # Text input as alternative
+            st.markdown("### ⌨️ Text Input")
+            user_question = st.text_input("Or type your question here:", placeholder="What is this document about?")
+            
+            # Process question
+            if st.button("❓ Ask Question", type="primary"):
+                question_to_process = user_question
+                
+                # If we have audio data, attempt to transcribe it
+                if webrtc_ctx.audio_receiver:
+                    audio_data = audio_recorder.get_audio_data()
+                    if audio_data:
+                        # Attempt STT (will show warning about limitation)
+                        transcribed_text = st.session_state.processor.speech_to_text(audio_data)
+                        if transcribed_text:
+                            question_to_process = transcribed_text
+                
+                if question_to_process:
+                    with st.spinner("Finding relevant information and generating answer..."):
+                        try:
+                            # Find relevant chunks using RAG
+                            relevant_chunks = st.session_state.processor.find_relevant_chunks(
+                                question_to_process,
+                                st.session_state.text_chunks,
+                                st.session_state.embeddings
+                            )
+                            
+                            # Generate answer
+                            answer = st.session_state.processor.generate_answer(question_to_process, relevant_chunks)
+                            
+                            # Add to chat history
+                            st.session_state.chat_history.append({
+                                "question": question_to_process,
+                                "answer": answer,
+                                "timestamp": time.strftime("%H:%M:%S")
+                            })
+                            
+                            # Clear text input
                             st.rerun()
-                    else: st.warning("No audio recorded. Please start and stop recording again.")
-                else: st.error("Audio processor not found. Please refresh.")
+                            
+                        except Exception as e:
+                            st.error(f"Error processing question: {str(e)}")
+                else:
+                    st.warning("Please provide a question either by typing or using voice input.")
+            
+            # Display chat history
+            if st.session_state.chat_history:
+                st.markdown("### 💭 Chat History")
+                for i, chat in enumerate(reversed(st.session_state.chat_history)):
+                    with st.container():
+                        st.markdown(f"**🙋 Question ({chat['timestamp']}):** {chat['question']}")
+                        st.markdown(f"**🤖 Answer:** {chat['answer']}")
+                        
+                        # Attempt TTS for answer (will show warning about limitation)
+                        if st.button(f"🔊 Play Answer {len(st.session_state.chat_history)-i}", key=f"tts_{i}"):
+                            st.session_state.processor.text_to_speech(chat['answer'], voice_style)
+                        
+                        st.markdown("---")
+                
+                # Clear chat history button
+                if st.button("🗑️ Clear Chat History"):
+                    st.session_state.chat_history = []
+                    st.rerun()
+
+if __name__ == "__main__":
+    main()
