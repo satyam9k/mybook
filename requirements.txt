@@ -5,3 +5,4 @@ Pillow
 PyMuPDF
 streamlit-webrtc
 pyaudio
+soundfile
