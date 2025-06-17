@@ -3,4 +3,5 @@ google-generativeai
 numpy
 Pillow
 PyMuPDF
-streamlit-audiorecorder
+streamlit-webrtc
+pyaudio
