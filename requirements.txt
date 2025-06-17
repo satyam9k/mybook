@@ -4,5 +4,4 @@ numpy
 Pillow
 PyMuPDF
 streamlit-webrtc
-pyaudio
 soundfile
